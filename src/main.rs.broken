@@ -1,0 +1,746 @@
+use anyhow::Result;
+use eframe::{egui, App};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Instant;
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 600.0])
+            .with_min_inner_size([900.0, 550.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "FluxFlasher",
+        options,
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Box::new(FluxFlasher::default())
+        }),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct UsbDevice {
+    path: String,
+    size: String,
+    removable: bool,
+    mounted: bool,
+}
+
+struct FluxFlasher {
+    image_path: Option<PathBuf>,
+    image_size: Option<u64>,
+    devices: Vec<UsbDevice>,
+    selected_device: Option<usize>,
+    status: Arc<Mutex<String>>,
+    progress: Arc<Mutex<f32>>,
+    flashing: bool,
+    flashing_complete: bool,
+    validating: bool,
+    validation_progress: Arc<Mutex<f32>>,
+    validation_skipped: bool,
+    show_device_modal: bool,
+    show_settings_modal: bool,
+    show_completion_modal: bool,
+    flash_start_time: Option<Instant>,
+    bytes_written: Arc<Mutex<u64>>,
+    setting_report_errors: bool,
+    setting_trim_space: bool,
+}
+
+impl Default for FluxFlasher {
+    fn default() -> Self {
+        Self {
+            image_path: None,
+            image_size: None,
+            devices: Vec::new(),
+            selected_device: None,
+            status: Arc::new(Mutex::new(String::new())),
+            progress: Arc::new(Mutex::new(0.0)),
+            flashing: false,
+            flashing_complete: false,
+            validating: false,
+            validation_progress: Arc::new(Mutex::new(0.0)),
+            validation_skipped: false,
+            show_device_modal: false,
+            show_settings_modal: false,
+            show_completion_modal: false,
+            flash_start_time: None,
+            bytes_written: Arc::new(Mutex::new(0)),
+            setting_report_errors: false,
+            setting_trim_space: false,
+        }
+    }
+}
+
+// Color constants
+const BG_DARK: egui::Color32 = egui::Color32::from_rgb(47, 50, 53);
+const BG_MEDIUM: egui::Color32 = egui::Color32::from_rgb(71, 75, 79);
+const CARD_BG: egui::Color32 = egui::Color32::from_rgb(60, 63, 67);
+const ACCENT_CYAN: egui::Color32 = egui::Color32::from_rgb(0, 174, 239);
+const SUCCESS_GREEN: egui::Color32 = egui::Color32::from_rgb(76, 175, 80);
+const DISABLED_GREY: egui::Color32 = egui::Color32::from_rgb(100, 100, 110);
+const TEXT_WHITE: egui::Color32 = egui::Color32::WHITE;
+const TEXT_GREY: egui::Color32 = egui::Color32::from_rgb(160, 160, 170);
+
+impl App for FluxFlasher {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.devices.is_empty() && !self.flashing {
+            if let Ok(devices) = list_usb_devices() {
+                self.devices = devices;
+            }
+        }
+
+        let frame = egui::Frame::central_panel(&ctx.style()).fill(BG_MEDIUM);
+
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            // Top bar
+            egui::TopBottomPanel::top("top_bar")
+                .frame(egui::Frame::none().fill(BG_DARK).inner_margin(12.0))
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("⚡ FluxFlasher").size(18.0).color(TEXT_WHITE).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(egui::RichText::new("❓").size(16.0)).clicked() {}
+                            ui.add_space(5.0);
+                            if ui.button(egui::RichText::new("⚙").size(16.0)).clicked() {
+                                self.show_settings_modal = true;
+                            }
+                        });
+                    });
+                });
+
+            if self.flashing {
+                // Full-screen progress view for flashing
+                self.render_progress_fullscreen(ui);
+            } else if self.validating {
+                // Full-screen progress view for validation
+                self.render_validation_fullscreen(ui);
+            } else {
+                // Three-step workflow
+                ui.add_space(40.0);
+                
+                ui.vertical_centered(|ui| {
+                    egui::ScrollArea::horizontal()
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let step_width = 280.0;
+                                
+                                // Step 1: Select Image
+                                ui.add_space(10.0);
+                                self.render_step_card_1(ui, step_width);
+                                
+                                // Arrow
+                                ui.add_space(10.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(80.0);
+                                    ui.label(egui::RichText::new("→").size(24.0).color(TEXT_GREY));
+                                });
+                                ui.add_space(10.0);
+                                
+                                // Step 2: Select Target
+                                self.render_step_card_2(ui, step_width);
+                                
+                                // Arrow
+                                ui.add_space(10.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(80.0);
+                                    ui.label(egui::RichText::new("→").size(24.0).color(TEXT_GREY));
+                                });
+                                ui.add_space(10.0);
+                                
+                                // Step 3: Flash
+                                self.render_step_card_3(ui, step_width);
+                                ui.add_space(10.0);
+                            });
+                        });
+                });
+            }
+        });
+
+        if self.show_device_modal {
+            self.render_device_modal(ctx);
+        }
+
+        if self.show_settings_modal {
+            self.render_settings_modal(ctx);
+        }
+        
+        if self.show_completion_modal {
+            self.render_completion_modal(ctx);
+        }
+
+        ctx.request_repaint();
+    }
+}
+
+impl FluxFlasher {
+    fn render_step_card_1(&mut self, ui: &mut egui::Ui, width: f32) {
+        let is_complete = self.image_path.is_some();
+        
+        egui::Frame::none()
+            .fill(CARD_BG)
+            .stroke(egui::Stroke::new(2.0, if is_complete { SUCCESS_GREEN } else { DISABLED_GREY }))
+            .rounding(8.0)
+            .inner_margin(20.0)
+            .show(ui, |ui| {
+                ui.set_width(width);
+                ui.set_height(200.0);
+                
+                ui.vertical_centered(|ui| {
+                    // Step number and title
+                    ui.label(egui::RichText::new("1").size(32.0).color(TEXT_GREY).strong());
+                    ui.label(egui::RichText::new("Select Image").size(16.0).color(TEXT_WHITE));
+                    
+                    ui.add_space(15.0);
+                    
+                    if let Some(path) = &self.image_path {
+                        // Show selected file
+                        ui.label(egui::RichText::new(path.file_name().unwrap().to_string_lossy()).size(14.0).color(TEXT_WHITE));
+                        if let Some(size) = self.image_size {
+                            ui.label(egui::RichText::new(format_size(size)).size(12.0).color(TEXT_GREY));
+                        }
+                        ui.add_space(10.0);
+                        if !self.flashing && ui.button(egui::RichText::new("Change").size(12.0).color(ACCENT_CYAN)).clicked() {
+                            if let Some(new_path) = rfd::FileDialog::new().add_filter("Disk Images", &["iso", "img"]).pick_file() {
+                                self.image_size = std::fs::metadata(&new_path).ok().map(|m| m.len());
+                                self.image_path = Some(new_path);
+                            }
+                        }
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("✓ Ready").size(12.0).color(SUCCESS_GREEN));
+                    } else {
+                        // Select button
+                        let button = egui::Button::new(egui::RichText::new("Select Image").size(14.0).color(TEXT_WHITE))
+                            .fill(ACCENT_CYAN)
+                            .rounding(20.0)
+                            .min_size(egui::vec2(180.0, 40.0));
+                        
+                        if ui.add_enabled(!self.flashing, button).clicked() {
+                            if let Some(path) = rfd::FileDialog::new().add_filter("Disk Images", &["iso", "img"]).pick_file() {
+                                self.image_size = std::fs::metadata(&path).ok().map(|m| m.len());
+                                self.image_path = Some(path);
+                            }
+                        }
+                    }
+                });
+            });
+    }
+    
+    fn render_step_card_2(&mut self, ui: &mut egui::Ui, width: f32) {
+        let is_complete = self.selected_device.is_some();
+        
+        egui::Frame::none()
+            .fill(CARD_BG)
+            .stroke(egui::Stroke::new(2.0, if is_complete { SUCCESS_GREEN } else { DISABLED_GREY }))
+            .rounding(8.0)
+            .inner_margin(20.0)
+            .show(ui, |ui| {
+                ui.set_width(width);
+                ui.set_height(200.0);
+                
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("2").size(32.0).color(TEXT_GREY).strong());
+                    ui.label(egui::RichText::new("Select Target").size(16.0).color(TEXT_WHITE));
+                    
+                    ui.add_space(15.0);
+                    
+                    let device_info = self.selected_device.and_then(|idx| {
+                        self.devices.get(idx).map(|d| (d.path.clone(), d.size.clone()))
+                    });
+                    
+                    if let Some((path, size)) = device_info {
+                        ui.label(egui::RichText::new(&path).size(14.0).color(TEXT_WHITE));
+                        ui.label(egui::RichText::new(&size).size(12.0).color(TEXT_GREY));
+                        ui.add_space(10.0);
+                        if !self.flashing && ui.button(egui::RichText::new("Change").size(12.0).color(ACCENT_CYAN)).clicked() {
+                            if let Ok(devices) = list_usb_devices() {
+                                self.devices = devices;
+                            }
+                            self.show_device_modal = true;
+                        }
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("✓ Ready").size(12.0).color(SUCCESS_GREEN));
+                    } else {
+                        let button = egui::Button::new(egui::RichText::new("Select USB").size(14.0).color(TEXT_WHITE))
+                            .fill(ACCENT_CYAN)
+                            .rounding(20.0)
+                            .min_size(egui::vec2(180.0, 40.0));
+                        
+                        if ui.add_enabled(!self.flashing, button).clicked() {
+                            if let Ok(devices) = list_usb_devices() {
+                                println!("Found {} USB devices", devices.len());
+                                for dev in &devices {
+                                    println!("  Device: {} - {}", dev.path, dev.size);
+                                }
+                                self.devices = devices;
+                            } else {
+                                println!("Error listing USB devices");
+                            }
+                            self.show_device_modal = true;
+                        }
+                    }
+                });
+            });
+    }
+    
+    fn render_step_card_3(&mut self, ui: &mut egui::Ui, width: f32) {
+        let can_flash = self.image_path.is_some() && self.selected_device.is_some();
+        
+        egui::Frame::none()
+            .fill(CARD_BG)
+            .stroke(egui::Stroke::new(2.0, if can_flash { ACCENT_CYAN } else { DISABLED_GREY }))
+            .rounding(8.0)
+            .inner_margin(20.0)
+            .show(ui, |ui| {
+                ui.set_width(width);
+                ui.set_height(200.0);
+                
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("3").size(32.0).color(TEXT_GREY).strong());
+                    ui.label(egui::RichText::new("Flash!").size(16.0).color(TEXT_WHITE));
+                    
+                    ui.add_space(30.0);
+                    
+                    let button = egui::Button::new(egui::RichText::new("Flash!").size(18.0).strong().color(TEXT_WHITE))
+                        .fill(if can_flash { ACCENT_CYAN } else { DISABLED_GREY })
+                        .rounding(25.0)
+                        .min_size(egui::vec2(200.0, 50.0));
+                    
+                    if ui.add_enabled(can_flash && !self.flashing, button).clicked() {
+                        if let (Some(img), Some(dev_idx)) = (self.image_path.clone(), self.selected_device) {
+                            if let Some(device) = self.devices.get(dev_idx) {
+                                self.start_flash(img, device.path.clone());
+                            }
+                        }
+                    }
+                    
+                    ui.add_space(10.0);
+                    
+                    if !can_flash {
+                        ui.label(egui::RichText::new("Complete steps 1 & 2").size(11.0).color(TEXT_GREY));
+                    }
+                });
+            });
+    }
+    
+    fn render_progress_fullscreen(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(150.0);
+            
+            let progress = *self.progress.lock().unwrap();
+            
+            // Large percentage
+            ui.label(egui::RichText::new(format!("{}%", (progress * 100.0) as u32)).size(48.0).color(TEXT_WHITE).strong());
+            
+            ui.add_space(20.0);
+            
+            // Progress bar
+            ui.add_sized(
+                egui::vec2(600.0, 12.0),
+                egui::ProgressBar::new(progress).fill(ACCENT_CYAN).animate(true)
+            );
+            
+            ui.add_space(30.0);
+            
+            // Speed and ETA
+            if let Some(start_time) = self.flash_start_time {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let bytes_written = *self.bytes_written.lock().unwrap();
+                
+                if elapsed > 0.0 && bytes_written > 0 {
+                    let speed_bps = bytes_written as f32 / elapsed;
+                    let speed_mbps = speed_bps / (1024.0 * 1024.0);
+                    
+                    ui.label(egui::RichText::new(format!("Speed: {:.1} MB/s", speed_mbps)).size(14.0).color(TEXT_GREY));
+                    
+                    if let Some(total_size) = self.image_size {
+                        let remaining = total_size.saturating_sub(bytes_written);
+                        if speed_bps > 0.0 {
+                            let eta_secs = remaining as f32 / speed_bps;
+                            ui.label(egui::RichText::new(format!("ETA: {}", format_duration(eta_secs as u64))).size(14.0).color(TEXT_GREY));
+                        }
+                    }
+                }
+            }
+            
+            ui.add_space(20.0);
+            let status = self.status.lock().unwrap().clone();
+            ui.label(egui::RichText::new(status).size(12.0).color(TEXT_GREY));
+        });
+    }
+
+    fn render_device_modal(&mut self, ctx: &egui::Context) {
+        let mut close_modal = false;
+
+        egui::Window::new("Select Target USB")
+            .open(&mut self.show_device_modal)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(600.0);
+
+                if self.devices.is_empty() {
+                    ui.label("No removable USB devices found.");
+                    ui.label("Please insert a USB drive and try again.");
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("").size(12.0));
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("Device").strong().size(12.0));
+                        ui.add_space(200.0);
+                        ui.label(egui::RichText::new("Size").strong().size(12.0));
+                    });
+
+                    ui.separator();
+
+                    let mut selected_idx = None;
+                    for (idx, device) in self.devices.iter().enumerate() {
+                        let is_selected = self.selected_device == Some(idx);
+
+                        let response = ui.horizontal(|ui| {
+                            let checkbox = if is_selected { "●" } else { "○" };
+                            ui.label(egui::RichText::new(checkbox).size(16.0).color(ACCENT_CYAN));
+                            ui.add_space(10.0);
+                            ui.label(&device.path);
+                            ui.add_space(150.0);
+                            ui.label(&device.size);
+                        });
+
+                        if response.response.interact(egui::Sense::click()).clicked() {
+                            selected_idx = Some(idx);
+                        }
+                    }
+
+                    if let Some(idx) = selected_idx {
+                        self.selected_device = Some(idx);
+                    }
+                }
+
+                ui.add_space(20.0);
+
+                ui.horizontal(|ui| {
+                    let cancel_button = egui::Button::new(egui::RichText::new("Cancel").color(TEXT_GREY))
+                        .stroke(egui::Stroke::new(1.0, TEXT_GREY))
+                        .fill(egui::Color32::TRANSPARENT)
+                        .rounding(20.0)
+                        .min_size(egui::vec2(120.0, 40.0));
+
+                    if ui.add(cancel_button).clicked() {
+                        close_modal = true;
+                    }
+
+                    ui.add_space(10.0);
+
+                    let select_button = egui::Button::new(egui::RichText::new(format!("Select {}", if self.selected_device.is_some() { "1" } else { "0" })).color(TEXT_WHITE))
+                        .fill(ACCENT_CYAN)
+                        .rounding(20.0)
+                        .min_size(egui::vec2(120.0, 40.0));
+
+                    if ui.add_enabled(self.selected_device.is_some(), select_button).clicked() {
+                        close_modal = true;
+                    }
+                });
+            });
+
+        if close_modal {
+            self.show_device_modal = false;
+        }
+    }
+
+    fn render_settings_modal(&mut self, ctx: &egui::Context) {
+        let mut close_modal = false;
+
+        egui::Window::new("Settings")
+            .open(&mut self.show_settings_modal)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                ui.checkbox(&mut self.setting_report_errors, "Anonymously report errors");
+                ui.add_space(10.0);
+                ui.checkbox(&mut self.setting_trim_space, "Trim unallocated space on raw images");
+                ui.add_space(20.0);
+                ui.hyperlink_to("⚡ v0.1.0", "https://github.com/fluxflasher/fluxflasher");
+                ui.add_space(20.0);
+
+                ui.vertical_centered(|ui| {
+                    let ok_button = egui::Button::new(egui::RichText::new("OK").color(TEXT_WHITE))
+                        .fill(ACCENT_CYAN)
+                        .rounding(20.0)
+                        .min_size(egui::vec2(150.0, 40.0));
+
+                    if ui.add(ok_button).clicked() {
+                        close_modal = true;
+                    }
+                });
+            });
+
+        if close_modal {
+            self.show_settings_modal = false;
+        }
+    }
+
+    fn render_validation_fullscreen(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(150.0);
+            
+            let progress = *self.validation_progress.lock().unwrap();
+            
+            // Large percentage
+            ui.label(egui::RichText::new(format!("Validating {}%", (progress * 100.0) as u32)).size(48.0).color(TEXT_WHITE).strong());
+            
+            ui.add_space(20.0);
+            
+            // Progress bar
+            ui.add_sized(
+                egui::vec2(600.0, 12.0),
+                egui::ProgressBar::new(progress).fill(SUCCESS_GREEN).animate(true)
+            );
+            
+            ui.add_space(30.0);
+            
+            ui.label(egui::RichText::new("Verifying written data...").size(14.0).color(TEXT_GREY));
+            
+            ui.add_space(20.0);
+            
+            // Skip button
+            let skip_button = egui::Button::new(egui::RichText::new("Skip Validation").size(14.0).color(TEXT_WHITE))
+                .fill(DISABLED_GREY)
+                .rounding(20.0)
+                .min_size(egui::vec2(180.0, 40.0));
+            
+            if ui.add(skip_button).clicked() {
+                self.validation_skipped = true;
+                self.validating = false;
+                self.show_completion_modal = true;
+            }
+        });
+    }
+
+    fn render_completion_modal(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Flash Complete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+                
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    
+                    // Success icon
+                    ui.label(egui::RichText::new("✓").size(64.0).color(SUCCESS_GREEN));
+                    
+                    ui.add_space(15.0);
+                    
+                    ui.label(egui::RichText::new("Flash Completed Successfully!").size(20.0).color(TEXT_WHITE).strong());
+                    
+                    ui.add_space(10.0);
+                    
+                    if self.validation_skipped {
+                        ui.label(egui::RichText::new("(Validation skipped)").size(12.0).color(TEXT_GREY));
+                    } else {
+                        ui.label(egui::RichText::new("Data verified successfully").size(12.0).color(SUCCESS_GREEN));
+                    }
+                    
+                    ui.add_space(30.0);
+                    
+                    let ok_button = egui::Button::new(egui::RichText::new("OK").size(16.0).color(TEXT_WHITE))
+                        .fill(ACCENT_CYAN)
+                        .rounding(20.0)
+                        .min_size(egui::vec2(150.0, 45.0));
+                    
+                    if ui.add(ok_button).clicked() {
+                        self.show_completion_modal = false;
+                        self.flashing_complete = false;
+                        self.validation_skipped = false;
+                        // Reset for next flash
+                        self.image_path = None;
+                        self.selected_device = None;
+                    }
+                    
+                    ui.add_space(10.0);
+                });
+            });
+    }
+    fn start_flash(&mut self, image: PathBuf, device: String) {
+        self.flashing = true;
+        self.flashing_complete = false;
+        self.flash_start_time = Some(Instant::now());
+        *self.status.lock().unwrap() = "Starting flash operation...".to_string();
+        *self.progress.lock().unwrap() = 0.0;
+        *self.bytes_written.lock().unwrap() = 0;
+
+        let progress = self.progress.clone();
+        let status = self.status.clone();
+        let bytes_written = self.bytes_written.clone();
+
+        thread::spawn(move || {
+            let res = flash_image(&image, &device, progress.clone(), status.clone(), bytes_written.clone());
+            match res {
+                Ok(_) => {
+                    *status.lock().unwrap() = "Flash completed successfully!".to_string();
+                    *progress.lock().unwrap() = 1.0;
+                }
+                Err(e) => {
+                    *status.lock().unwrap() = format!("Flash error: {}", e);
+                    eprintln!("Flash error: {}", e);
+                }
+            }
+        });
+    }
+
+    fn render_validation_fullscreen(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(150.0);
+            
+            let progress = *self.validation_progress.lock().unwrap();
+            
+            ui.label(egui::RichText::new(format!("Validating {}%", (progress * 100.0) as u32)).size(48.0).color(TEXT_WHITE).strong());
+            ui.add_space(20.0);
+            
+            ui.add_sized(
+                egui::vec2(600.0, 12.0),
+                egui::ProgressBar::new(progress).fill(SUCCESS_GREEN).animate(true)
+            );
+            
+            ui.add_space(30.0);
+            ui.label(egui::RichText::new("Verifying written data...").size(14.0).color(TEXT_GREY));
+            ui.add_space(20.0);
+            
+            let skip_button = egui::Button::new(egui::RichText::new("Skip Validation").size(14.0).color(TEXT_WHITE))
+                .fill(DISABLED_GREY)
+                .rounding(20.0)
+                .min_size(egui::vec2(180.0, 40.0));
+            
+            if ui.add(skip_button).clicked() {
+                self.validation_skipped = true;
+                self.validating = false;
+                self.show_completion_modal = true;
+            }
+        });
+    }
+
+    fn render_completion_modal(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Flash Complete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(egui::RichText::new("✓").size(64.0).color(SUCCESS_GREEN));
+                    ui.add_space(15.0);
+                    ui.label(egui::RichText::new("Flash Completed Successfully!").size(20.0).color(TEXT_WHITE).strong());
+                    ui.add_space(10.0);
+                    
+                    if self.validation_skipped {
+                        ui.label(egui::RichText::new("(Validation skipped)").size(12.0).color(TEXT_GREY));
+                    } else {
+                        ui.label(egui::RichText::new("Data verified successfully").size(12.0).color(SUCCESS_GREEN));
+                    }
+                    
+                    ui.add_space(30.0);
+                    
+                    let ok_button = egui::Button::new(egui::RichText::new("OK").size(16.0).color(TEXT_WHITE))
+                        .fill(ACCENT_CYAN)
+                        .rounding(20.0)
+                        .min_size(egui::vec2(150.0, 45.0));
+                    
+                    if ui.add(ok_button).clicked() {
+                        self.show_completion_modal = false;
+                        self.flashing_complete = false;
+                        self.validation_skipped = false;
+                        self.image_path = None;
+                        self.selected_device = None;
+                    }
+                    
+                    ui.add_space(10.0);
+                });
+            });
+    }
+}
+
+fn list_usb_devices() -> Result<Vec<UsbDevice>> {
+    let out = Command::new("lsblk").args(["-ndo", "NAME,RM,TYPE,SIZE,MOUNTPOINT"]).output()?;
+            // Progress bar
+            ui.add_sized(
+                egui::vec2(600.0, 12.0),
+                egui::ProgressBar::new(progress).fill(SUCCESS_GREEN).animate(true)
+            );
+            
+            ui.add_space(30.0);
+            
+            ui.label(egui::RichText::new("Verifying written data...").size(14.0).color(TEXT_GREY));
+            
+            ui.add_space(20.0);
+            
+            // Skip button
+            let skip_button = egui::Button::new(egui::RichText::new("Skip Validation").size(14.0).color(TEXT_WHITE))
+                .fill(DISABLED_GREY)
+                .rounding(20.0)
+                .min_size(egui::vec2(180.0, 40.0));
+            
+            if ui.add(skip_button).clicked() {
+                self.validation_skipped = true;
+                self.validating = false;
+                self.show_completion_modal = true;
+            }
+        });
+    }
+
+    fn render_completion_modal(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Flash Complete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+                
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    
+                    // Success icon
+                    ui.label(egui::RichText::new("✓").size(64.0).color(SUCCESS_GREEN));
+                    
+                    ui.add_space(15.0);
+                    
+                    ui.label(egui::RichText::new("Flash Completed Successfully!").size(20.0).color(TEXT_WHITE).strong());
+                    
+                    ui.add_space(10.0);
+                    
+                    if self.validation_skipped {
+                        ui.label(egui::RichText::new("(Validation skipped)").size(12.0).color(TEXT_GREY));
+                    } else {
+                        ui.label(egui::RichText::new("Data verified successfully").size(12.0).color(SUCCESS_GREEN));
+                    }
+                    
+                    ui.add_space(30.0);
+                    
+                    let ok_button = egui::Button::new(egui::RichText::new("OK").size(16.0).color(TEXT_WHITE))
+                        .fill(ACCENT_CYAN)
+                        .rounding(20.0)
+                        .min_size(egui::vec2(150.0, 45.0));
+                    
+                    if ui.add(ok_button).clicked() {
+                        self.show_completion_modal = false;
+                        self.flashing_complete = false;
+                        self.validation_skipped = false;
+                        // Reset for next flash
+                        self.image_path = None;
+                        self.selected_device = None;
+                    }
+                    
+                    ui.add_space(10.0);
+                });
+            });
+    }
